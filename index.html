@@ -189,15 +189,16 @@
       <div class="hud-box">Score: <span id="scoreDisplay">0</span></div>
       <div class="hud-box">🏆 Best: <span id="bestDisplay">0</span></div>
       <div class="hud-box">Speed: <span id="speedDisplay">1x</span></div>
+      <div class="hud-box">🦑 Ink: <span id="inkDisplay">●●●</span></div>
     </div>
 
     <div id="overlay">
       <h2 id="overlayTitle">🐙 Octocat Runner</h2>
-      <p id="overlayMsg">Help Octocat jump over evil bugs!<br>The faster you go, the more points you earn.</p>
+      <p id="overlayMsg">Help Octocat jump over evil bugs!<br>Shoot <b>ink</b> 🦑 to splat most bugs — but shielded 🛡️ ones must be <b>jumped</b>!</p>
       <div class="score-display" id="overlayScore" style="display:none"></div>
       <div class="best-display" id="overlayBest" style="display:none"></div>
       <button id="start-btn">▶ Start Game</button>
-      <div id="instructions">Space / ↑ / Click to jump &nbsp;|&nbsp; Double-jump allowed!</div>
+      <div id="instructions">Space / ↑ / Click to jump &nbsp;|&nbsp; X / Shift to shoot ink 🦑 &nbsp;|&nbsp; Double-jump allowed!</div>
 
       <div id="leaderboard">
         <h3>🏆 Session High Scores</h3>
@@ -217,6 +218,9 @@ const GRAVITY   = 0.55;
 const JUMP_VEL  = -12.5;
 const BASE_SPEED = 4;
 const SCORE_INCREMENT_RATE = 0.05; // score gained per frame per unit of speed
+const INK_BLOB_SPEED = BASE_SPEED + 8;   // fixed velocity so blobs are consistent all game
+const INK_SPLAT_DURATION = 18;           // frames the splat ring animation lasts
+const INK_SPLAT_EXPANSION = 22;          // max extra radius the splat ring grows to
 
 // ─── State ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('gameCanvas');
@@ -228,6 +232,13 @@ let bestScore = 0;
 let frameCount = 0;
 let speed = BASE_SPEED;
 let sessionScores = [];
+
+// ─── Ink ammo ────────────────────────────────────────────────────────────────
+const MAX_INK = 3;
+let inkAmmo = MAX_INK;
+let inkRechargeTimer = 0;
+const INK_RECHARGE_FRAMES = 150; // ~2.5 s at 60 fps
+let inkBlobs = [];
 
 // ─── Octocat sprite data ──────────────────────────────────────────────────────
 // Drawn procedurally with canvas shapes
@@ -360,10 +371,11 @@ let obstacleTimer = 0;
 let obstacleInterval = 90; // frames
 
 const BUG_TYPES = [
-  { label: '🐛', emoji: true, w: 36, h: 36, color: '#da3633' },
-  { label: '💀', emoji: true, w: 34, h: 34, color: '#8b949e' },
-  { label: '⚡', emoji: true, w: 30, h: 38, color: '#e3b341' },
-  { label: '🔥', emoji: true, w: 32, h: 36, color: '#f85149' },
+  { label: '🐛', emoji: true, w: 36, h: 36, color: '#da3633', shielded: false },
+  { label: '💀', emoji: true, w: 34, h: 34, color: '#8b949e', shielded: false },
+  { label: '⚡', emoji: true, w: 30, h: 38, color: '#e3b341', shielded: false },
+  { label: '🔥', emoji: true, w: 32, h: 36, color: '#f85149', shielded: false },
+  { label: '🛡️', emoji: true, w: 38, h: 42, color: '#58a6ff', shielded: true  }, // ink-proof! must jump
 ];
 
 function spawnObstacle() {
@@ -376,6 +388,7 @@ function spawnObstacle() {
     h,
     label: type.label,
     color: type.color,
+    shielded: type.shielded,
     scored: false,
   });
 }
@@ -427,6 +440,15 @@ function drawObstacles() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(obs.label, obs.x + obs.w / 2, obs.y + obs.h / 2);
+
+    // shielded indicator
+    if (obs.shielded) {
+      ctx.font = 'bold 10px sans-serif';
+      ctx.fillStyle = '#58a6ff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText('JUMP!', obs.x + obs.w / 2, obs.y - 14);
+    }
   }
 }
 
@@ -559,6 +581,149 @@ function drawParticles() {
   ctx.globalAlpha = 1;
 }
 
+// ─── Ink blobs ────────────────────────────────────────────────────────────────
+function shootInk() {
+  if (inkAmmo <= 0) {
+    playBeep(150, 0.08, 'square', 0.1); // dry-fire click
+    return;
+  }
+  inkAmmo--;
+  updateInkHUD();
+  // fire from Octocat's front at mid-body height
+  inkBlobs.push({
+    x: OC.x + OC.w,
+    y: OC.y - OC.h / 2,
+    vx: INK_BLOB_SPEED,
+    r: 7,
+    life: 1,
+    splat: false,
+    splatTimer: 0,
+  });
+  playBeep(220, 0.08, 'sine', 0.18);
+  setTimeout(() => playBeep(180, 0.06, 'sine', 0.12), 60);
+}
+
+function spawnInkParticles(x, y) {
+  for (let i = 0; i < 14; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const spd   = 1.5 + Math.random() * 3.5;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * spd,
+      vy: Math.sin(angle) * spd - 1,
+      life: 1,
+      color: ['#6e40c9','#8957e5','#d2a8ff','#3d1f8f'][Math.floor(Math.random() * 4)],
+      r: 3 + Math.random() * 5,
+    });
+  }
+}
+
+function updateInkBlobs() {
+  // recharge
+  if (inkAmmo < MAX_INK) {
+    inkRechargeTimer++;
+    if (inkRechargeTimer >= INK_RECHARGE_FRAMES) {
+      inkRechargeTimer = 0;
+      inkAmmo++;
+      updateInkHUD();
+      addFloater('INK +1 🦑', OC.x + OC.w / 2, OC.y - OC.h - 20, '#d2a8ff');
+    }
+  } else {
+    inkRechargeTimer = 0;
+  }
+
+  for (const b of inkBlobs) {
+    if (b.splat) {
+      b.splatTimer++;
+      continue;
+    }
+    b.x += b.vx;
+
+    // hit a non-shielded obstacle
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const obs = obstacles[i];
+      if (obs.shielded) continue;
+      if (
+        b.x + b.r > obs.x &&
+        b.x - b.r < obs.x + obs.w &&
+        b.y + b.r > obs.y &&
+        b.y - b.r < obs.y + obs.h
+      ) {
+        // splat!
+        b.splat = true;
+        b.splatX = obs.x + obs.w / 2;
+        b.splatY = obs.y + obs.h / 2;
+        spawnInkParticles(b.splatX, b.splatY);
+        const splatMessages = ['SPLAT! 🦑', 'INKED! 💜', 'SQUASHED! 🎉', 'BUG FIXED! ✅'];
+        addFloater(splatMessages[Math.floor(Math.random() * splatMessages.length)], obs.x + obs.w / 2, obs.y - 16, '#d2a8ff');
+        score += 10;
+        playBeep(600, 0.05, 'sine', 0.15);
+        setTimeout(() => playBeep(800, 0.05, 'sine', 0.12), 50);
+        obstacles.splice(i, 1);
+        break;
+      }
+    }
+
+    // hit a shielded obstacle – deflect
+    for (const obs of obstacles) {
+      if (!obs.shielded) continue;
+      if (
+        b.x + b.r > obs.x &&
+        b.x - b.r < obs.x + obs.w &&
+        b.y + b.r > obs.y &&
+        b.y - b.r < obs.y + obs.h
+      ) {
+        b.splat = true;
+        b.splatX = b.x;
+        b.splatY = b.y;
+        spawnInkParticles(b.x, b.y);
+        addFloater('BLOCKED! 🛡️', obs.x + obs.w / 2, obs.y - 16, '#58a6ff');
+        playBeep(180, 0.12, 'square', 0.15);
+        break;
+      }
+    }
+  }
+
+  inkBlobs = inkBlobs.filter(b => !b.splat || b.splatTimer < INK_SPLAT_DURATION);
+}
+
+function drawInkBlobs() {
+  for (const b of inkBlobs) {
+    if (b.splat) {
+      // expanding splat ring
+      const progress = b.splatTimer / INK_SPLAT_DURATION;
+      ctx.globalAlpha = 1 - progress;
+      ctx.fillStyle = '#8957e5';
+      ctx.beginPath();
+      ctx.arc(b.splatX, b.splatY, b.r + progress * INK_SPLAT_EXPANSION, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      continue;
+    }
+    // flying blob with a wobbly trail
+    ctx.save();
+    ctx.shadowColor = '#8957e5';
+    ctx.shadowBlur = 10;
+    ctx.fillStyle = '#6e40c9';
+    ctx.beginPath();
+    ctx.ellipse(b.x, b.y, b.r * 1.6, b.r, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // small trailing drops
+    ctx.fillStyle = '#d2a8ff';
+    ctx.beginPath();
+    ctx.arc(b.x - b.r * 2.2, b.y, b.r * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function updateInkHUD() {
+  const el = document.getElementById('inkDisplay');
+  if (!el) return;
+  el.textContent = '●'.repeat(inkAmmo) + '○'.repeat(MAX_INK - inkAmmo);
+  el.style.color = inkAmmo > 0 ? '#d2a8ff' : '#6e7681';
+}
+
 // ─── Score floaters ───────────────────────────────────────────────────────────
 let floaters = [];
 
@@ -677,8 +842,12 @@ function startGame() {
   obstacles     = [];
   particles     = [];
   floaters      = [];
+  inkBlobs      = [];
+  inkAmmo       = MAX_INK;
+  inkRechargeTimer = 0;
   obstacleTimer = 0;
   OC.reset();
+  updateInkHUD();
   hideOverlay();
   requestAnimationFrame(loop);
 }
@@ -738,6 +907,7 @@ function loop(ts) {
   updateObstacles();
   updateParticles();
   updateFloaters();
+  updateInkBlobs();
 
   if (checkCollision()) {
     gameOver();
@@ -745,6 +915,7 @@ function loop(ts) {
     ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
     drawScenery();
     drawObstacles();
+    drawInkBlobs();
     OC.draw();
     ctx.fillStyle = 'rgba(248,81,73,0.3)';
     ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
@@ -756,6 +927,7 @@ function loop(ts) {
   ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
   drawScenery();
   drawObstacles();
+  drawInkBlobs();
   OC.draw();
   drawParticles();
   drawFloaters();
@@ -770,14 +942,25 @@ function handleJump() {
   }
 }
 
+function handleShoot() {
+  if (state === 'playing') {
+    shootInk();
+  }
+}
+
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
     e.preventDefault();
     handleJump();
   }
+  if (e.code === 'KeyX' || e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+    e.preventDefault();
+    handleShoot();
+  }
 });
 
 canvas.addEventListener('click',     handleJump);
+canvas.addEventListener('contextmenu', e => { e.preventDefault(); handleShoot(); });
 canvas.addEventListener('touchstart', e => { e.preventDefault(); handleJump(); }, { passive: false });
 
 startBtn.addEventListener('click', startGame);
@@ -788,6 +971,7 @@ startBtn.addEventListener('click', startGame);
   drawScenery();
   OC.draw();
   updateLeaderboard();
+  updateInkHUD();
 })();
 </script>
 </body>
